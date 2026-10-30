@@ -1,0 +1,28 @@
+diff --git a/src/main/scala/yunsuan/encoding/Opcode/VialuOpcode.scala b/src/main/scala/yunsuan/encoding/Opcode/VialuOpcode.scala
+index 987cba8..15bf65c 100644
+--- a/src/main/scala/yunsuan/encoding/Opcode/VialuOpcode.scala
++++ b/src/main/scala/yunsuan/encoding/Opcode/VialuOpcode.scala
+@@ -38,6 +38,8 @@ object VialuOpcode {
+   def vasub  = 30.U(width.W)
+   def vssrl  = 31.U(width.W)
+   def vssra  = 32.U(width.W)
++  // custom (CIE): vdot.vv, 33 is the only free opcode in 0..55
++  def vdot   = 33.U(width.W)
+   def vmvsx  = 46.U(width.W)
+   // Zvbb
+   def vcpop  = 39.U(width.W)
+diff --git a/src/main/scala/yunsuan/package.scala b/src/main/scala/yunsuan/package.scala
+index ef6d1e1..3cfb38e 100644
+--- a/src/main/scala/yunsuan/package.scala
++++ b/src/main/scala/yunsuan/package.scala
+@@ -188,6 +188,10 @@ package object yunsuan {
+     def vror_vv     = LiteralCat(FMT.VVV  , UINT, VialuOpcode.vror)   // "b00_0_110110".U(OpTypeWidth.W) // vror
+     def vwsll_vv    = LiteralCat(FMT.WVW  , UINT, VialuOpcode.vwsll)  // "b10_0_110111".U(OpTypeWidth.W) // vwsll
+ 
++    // custom (CIE): vdot.vv, e8 x4 -> e32. FMT.VVV keeps vs1/vs2/vd = vsew so widen == false,
++    // the datapath (Vdot32 in VIAluFix) bypasses the ALU and Mgu anyway.
++    def vdot_vv     = LiteralCat(FMT.VVV  , SINT, VialuOpcode.vdot)   // "b00_1_100001".U(OpTypeWidth.W) = 0x061 // vdot
++
+     def getOpcode(fuOpType: UInt) : UInt = fuOpType(5, 0)
+ 
+     def isSigned(fuOpType: UInt) : Bool = fuOpType(6)

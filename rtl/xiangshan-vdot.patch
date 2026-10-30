@@ -1,0 +1,88 @@
+diff --git a/src/main/scala/xiangshan/backend/decode/VecDecoder.scala b/src/main/scala/xiangshan/backend/decode/VecDecoder.scala
+index 3764191..af1497a 100644
+--- a/src/main/scala/xiangshan/backend/decode/VecDecoder.scala
++++ b/src/main/scala/xiangshan/backend/decode/VecDecoder.scala
+@@ -185,8 +185,16 @@ case class VST(src2: BitPat, fuOp: BitPat, strided: Boolean = false, indexed: Bo
+ }
+ 
+ object VecDecoder extends DecodeConstants {
++  /* custom-0 (CIE): vdot.vv vd, vs2, vs1
++   *   opcode = 0x0B (custom-0), funct6 = 100000, funct3 = 000, vm = ?
++   *   enc = (funct7 << 25) | (vs2 << 20) | (vs1 << 15) | (funct3 << 12) | (vd << 7) | 0x0B
++   *   funct7 = funct6 << 1 | vm   => 0x8220818b = vdot.vv v3, v1, v2 (vm = 1)
++   */
++  val VDOT_VV = BitPat("b100000???????????000?????0001011")
++
+   val opivv: Array[(BitPat, XSDecodeBase)] = Array(
+     VADD_VV         -> OPIVV(FuType.vialuF, VialuFixType.vadd_vv, T, F, F),
++    VDOT_VV         -> OPIVV(FuType.vialuF, VialuFixType.vdot_vv, T, F, F),
+     VSUB_VV         -> OPIVV(FuType.vialuF, VialuFixType.vsub_vv, T, F, F),
+ 
+     VMINU_VV        -> OPIVV(FuType.vialuF, VialuFixType.vminu_vv, T, F, F),
+diff --git a/src/main/scala/xiangshan/backend/fu/wrapper/VIAluFix.scala b/src/main/scala/xiangshan/backend/fu/wrapper/VIAluFix.scala
+index 75dd676..abdebba 100644
+--- a/src/main/scala/xiangshan/backend/fu/wrapper/VIAluFix.scala
++++ b/src/main/scala/xiangshan/backend/fu/wrapper/VIAluFix.scala
+@@ -6,8 +6,8 @@ import chisel3.util._
+ import chisel3.util.experimental.decode.{QMCMinimizer, TruthTable, decoder}
+ import utility.{DelayN, XSError}
+ import xiangshan.XSCoreParamsKey
+-import xiangshan.backend.fu.vector.Bundles.{VConfig, VSew}
+-import xiangshan.backend.fu.vector.{Mgu, Mgtu, VecPipedFuncUnit}
++import xiangshan.backend.fu.vector.Bundles.{VConfig, VLmul, VSew}
++import xiangshan.backend.fu.vector.{Mgu, Mgtu, VecPipedFuncUnit, Vdot32}
+ import xiangshan.backend.fu.vector.Utils.VecDataToMaskDataVec
+ import xiangshan.backend.fu.vector.utils.VecDataSplitModule
+ import xiangshan.backend.fu.{FuConfig, FuType}
+@@ -355,9 +355,48 @@ class VIAluFix(cfg: FuConfig)(implicit p: Parameters) extends VecPipedFuncUnit(c
+   mgtu.io.in.vd := Mux(dstMask && !outVecCtrl.isOpMask, mgu.io.out.vd, outVd)
+   mgtu.io.in.vl := outVl
+ 
+-  io.out.bits.res.data := Mux(outVstartGeVl, outOldVd, Mux(dstMask, mgtu.io.out.vd, mgu.io.out.vd))
+-  io.out.bits.res.vxsat.get := Mux(outVstartGeVl, false.B, (outVxsatReal & mgu.io.out.active).orR)
+-  io.out.bits.ctrl.exceptionVec.get(ExceptionNO.illegalInstr) := mgu.io.out.illegal && !outVstartGeVl
++  /* ------------------------------------------------------------------
++   * custom vdot.vv (CIE): vd.e32[i] = sum_k sext8(vs2[4i+k]) * sext8(vs1[4i+k])
++   *
++   * It does not go through mgu: mgu interprets vstart/vl as element indexes of
++   * info.eew, and outEew only supports vsew / vsew + 1, while vdot goes from e8
++   * sources to e32 results (two levels apart). Mask / tail are resolved here on
++   * 32-bit destination elements:
++   *   - vl counts source bytes, so #destination elements = ceil(vl / 4)
++   *   - destination element i is enabled by v0[i] when vm = 0
++   *   - masked-off / tail elements follow vma / vta (1 -> all ones, 0 -> old vd)
++   * ------------------------------------------------------------------ */
++  private val isVdot = inCtrl.fuOpType === VialuFixType.vdot_vv
++  private val outIsVdot = RegEnable(isVdot, io.in.valid)
++
++  private val vdot = Module(new Vdot32)
++  vdot.io.vs2 := vs2
++  vdot.io.vs1 := vs1
++  // VIntFixpAlu64b registers its result (latency = 1), keep vdot on the same beat as outVd
++  private val outVdotRes = RegEnable(Cat(vdot.io.out.reverse.map(_.asUInt)), io.in.valid)
++
++  private val vdotOutVl = (outVl +& 3.U) >> 2 // ceil(vl / 4)
++  private val outVdotVd = VecInit((0 until 4).map { i =>
++    val dotElem = outVdotRes(32 * i + 31, 32 * i)
++    val oldElem = outOldVd(32 * i + 31, 32 * i)
++    Mux((i * 4).U < outVstart, oldElem, // vstart is a source byte index
++      Mux(i.U >= vdotOutVl, Mux(outVecCtrl.vta, Fill(32, 1.U), oldElem),
++        Mux(!outSrcMask(i), Mux(outVecCtrl.vma, Fill(32, 1.U), oldElem), dotElem)))
++  }).asUInt
++
++  // vdot is only defined for vtype.vsew = e8, vtype.vlmul = m1 and a single uop.
++  // vl <= 16 (== VLEN / 8 == VLMAX for e8/m1) is unreachable through a conforming
++  // vsetvli, it is kept as a defensive guard: with vl > 16 the uop splitter would
++  // slice the instruction by 16 e8 bytes and the second uop would write vd at the
++  // wrong byte offset, so such a request must not be executed.
++  private val outIsVdotIllegal = RegEnable(
++    isVdot && (vill || vsew =/= VSew.e8 || vlmul =/= VLmul.m1 || vl > 16.U), io.in.valid)
++
++  io.out.bits.res.data := Mux(outVstartGeVl, outOldVd,
++    Mux(outIsVdot, outVdotVd, Mux(dstMask, mgtu.io.out.vd, mgu.io.out.vd)))
++  io.out.bits.res.vxsat.get := Mux(outVstartGeVl || outIsVdot, false.B, (outVxsatReal & mgu.io.out.active).orR)
++  io.out.bits.ctrl.exceptionVec.get(ExceptionNO.illegalInstr) :=
++    (mgu.io.out.illegal || outIsVdotIllegal) && !outVstartGeVl
+ 
+   // util function
+   def splitMask(maskIn: UInt, sew: SewOH): Vec[UInt] = {

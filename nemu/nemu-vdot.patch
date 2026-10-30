@@ -1,0 +1,147 @@
+diff --git a/src/isa/riscv64/include/isa-all-instr.h b/src/isa/riscv64/include/isa-all-instr.h
+index 2f18ca17..64aca700 100644
+--- a/src/isa/riscv64/include/isa-all-instr.h
++++ b/src/isa/riscv64/include/isa-all-instr.h
+@@ -201,7 +201,7 @@
+   f(vfwsub) f(vfwredosum) f(vfwadd_w) f(vfwsub_w) \
+   f(vfwmul) f(vfwmacc) f(vfwnmacc) f(vfwmsac) f(vfwnmsac) \
+   f(vandn) f(vbrev_v) f(vbrev8_v) f(vrev8_v) f(vclz_v) f(vctz_v) \
+-  f(vrol) f(vror) f(vwsll) f(vcpop_v)
++  f(vrol) f(vror) f(vwsll) f(vcpop_v) f(vdot)
+ #else // CONFIG_RVV
+ #define VECTOR_INSTR_TERNARY(f)
+ #endif // CONFIG_RVV
+diff --git a/src/isa/riscv64/instr/decode.c b/src/isa/riscv64/instr/decode.c
+index 11290c89..b2472f2c 100644
+--- a/src/isa/riscv64/instr/decode.c
++++ b/src/isa/riscv64/instr/decode.c
+@@ -98,6 +98,8 @@ def_THelper(main) {
+ #endif // CONFIG_FPU_NONE
+ #ifdef CONFIG_RVV
+   def_INSTR_IDTAB("??????? ????? ????? ??? ????? 10101 ??", OP_V  , OP_V);
++  // custom-0 vdot.vv: funct6=100000, funct3=000, opcode=0001011, vm = funct7[0]
++  def_INSTR_IDTAB("100000 ? ????? ????? 000 ????? 0001011", vdot  , vdot);
+ #endif // CONFIG_RVV
+ #ifdef CONFIG_RV_AME
+   def_INSTR_TAB  ("??????? ????? ????? ??? ????? 01010 ??",         OP_M);
+diff --git a/src/isa/riscv64/instr/rvv/decode.h b/src/isa/riscv64/instr/rvv/decode.h
+index ee7618e0..731a032a 100644
+--- a/src/isa/riscv64/instr/rvv/decode.h
++++ b/src/isa/riscv64/instr/rvv/decode.h
+@@ -46,6 +46,19 @@ static inline def_DHelper(OP_V) { // 10_101, same to R
+   */
+ }
+ 
++// custom-0 vdot.vv: opcode=0x0B, funct6=100000, funct3=000, funct7=funct6<<1|vm
++// vd.e32[i] = sum_{k=0..3} sext8(vs2[4i+k]) * sext8(vs1[4i+k]), i in [0, 4)
++// Not a regular .vv op: the sources are always 16 x int8 (e8, m1) and the
++// destination elements are e32, so v_width / vtype are not used for decoding.
++static inline def_DHelper(vdot) {
++  decode_op_r(s, id_src1, s->isa.instr.v_opv.v_vs1, true);
++  decode_op_r(s, id_src2, s->isa.instr.v_opv.v_vs2, true);
++  decode_op_r(s, id_dest, s->isa.instr.v_opv.v_vd, false);
++  s->src_vmode = SRC_VV;
++  s->v_width = 1;
++  s->vm = s->isa.instr.v_opv.v_vm; // 1: unmasked; 0: v0[i] masks 32-bit output element i
++}
++
+ static inline def_DHelper(vfunary0_dispatch) {
+     s->src_vmode = SRC_V;
+ }
+diff --git a/src/isa/riscv64/instr/rvv/vcompute.h b/src/isa/riscv64/instr/rvv/vcompute.h
+index 2bcb6aae..a4c0e63d 100644
+--- a/src/isa/riscv64/instr/rvv/vcompute.h
++++ b/src/isa/riscv64/instr/rvv/vcompute.h
+@@ -23,6 +23,11 @@ def_EHelper(vadd) {
+   ARITH(ADD, SIGNED)
+ }
+ 
++// custom-0 vdot.vv: 16 x int8 dot product -> 4 x int32, see vector_dot_instr()
++def_EHelper(vdot) {
++  vector_dot_instr(s);
++}
++
+ def_EHelper(vsub) {
+   ARITH(SUB, SIGNED)
+ }
+diff --git a/src/isa/riscv64/instr/rvv/vcompute_impl.c b/src/isa/riscv64/instr/rvv/vcompute_impl.c
+index 4017901a..390198e7 100644
+--- a/src/isa/riscv64/instr/rvv/vcompute_impl.c
++++ b/src/isa/riscv64/instr/rvv/vcompute_impl.c
+@@ -1848,6 +1848,64 @@ void float_reduction_computing(Decode *s) {
+   vstart->val = 0;
+ }
+ 
++/* ------------------------------------------------------------------------
++ * custom-0 vdot.vv: opcode=0x0B, funct6=100000, funct3=000, funct7=funct6<<1|vm
++ *
++ *   vd.e32[i] = sum_{k=0..3} sext8(vs2[4i+k]) * sext8(vs1[4i+k]), i in [0,4)
++ *
++ * vs2/vs1 are always 16 x int8 (vtype.vsew == e8, vlmul == m1) and vl counts
++ * source bytes, so ceil(vl/4) destination elements are produced. The sum is
++ * bounded by [-65024, 65536]; the 32-bit two's complement result is written,
++ * no saturation happens and vxsat is never set.
++ *
++ * mask / tail / vstart are resolved per 32-bit destination element:
++ *   - vstart is a source byte index: element i with i*4 < vstart keeps old vd
++ *   - vm == 0: element i is enabled by v0[i]
++ *   - masked-off element: vma ? 0xffffffff : old vd
++ *   - tail element (i >= ceil(vl/4)): vta ? 0xffffffff : old vd
++ * vstart >= vl leaves vd completely untouched, which is what all the other
++ * NEMU vector instructions do (check_vstart_ignore() in vcommon.c) and what
++ * the XiangShan writeback mux does (outVstartGeVl in VIAluFix.scala).
++ * ------------------------------------------------------------------------ */
++void vector_dot_instr(Decode *s) {
++  require_vector(true); // mstatus.VS != 0 && vtype.vill == 0
++  if (vtype->vsew != 0 || vtype->vlmul != 0 || vl->val > VLEN / 8) {
++    longjmp_exception(EX_II); // only e8 / m1 / vl <= 16 are defined
++  }
++
++  if (vstart->val < vl->val) {
++    const int vlout = ((int)vl->val + 3) / 4; // number of produced e32 elements
++    for (int i = 0; i < VLEN / 32; i++) {     // e32 / m1 => 4 destination elements
++      if ((uint64_t)(i * 4) < vstart->val) {
++        continue; // suppressed by vstart: keep the old vd element
++      }
++      int32_t elem;
++      if (i >= vlout) {
++        if (!vtype->vta) continue; // tail, vta = 0: keep the old vd element
++        elem = -1;
++      } else if (s->vm == 0 && get_mask(0, i) == 0) {
++        if (!vtype->vma) continue; // masked off, vma = 0: keep the old vd element
++        elem = -1;
++      } else {
++        int32_t acc = 0;
++        for (int k = 0; k < 4; k++) {
++          rtlreg_t a = 0, b = 0;
++          get_vreg(id_src2->reg, i * 4 + k, &a, 0, 0, SIGNED, 1); // e8, m1, sext
++          get_vreg(id_src1->reg, i * 4 + k, &b, 0, 0, SIGNED, 1);
++          acc += (int32_t)(a * b);
++        }
++        elem = acc;
++      }
++      rtlreg_t res = (uint32_t)elem;
++      set_vreg(id_dest->reg, i, res, 2, 0, 1); // e32 element i
++    }
++  }
++
++  rtl_li(s, s0, 0);
++  vcsr_write(IDXVSTART, s0);
++  vp_set_dirty();
++}
++
+ // dirty job here
+ #undef s0
+ #undef s1
+diff --git a/src/isa/riscv64/instr/rvv/vcompute_impl.h b/src/isa/riscv64/instr/rvv/vcompute_impl.h
+index 07406f6c..ecd63c12 100644
+--- a/src/isa/riscv64/instr/rvv/vcompute_impl.h
++++ b/src/isa/riscv64/instr/rvv/vcompute_impl.h
+@@ -79,6 +79,7 @@ enum fp_wop_t {
+ void fp_set_dirty();
+ void vp_set_dirty();
+ void arithmetic_instr(int opcode, int is_signed, int widening, int narrow, int dest_mask, Decode *s);
++void vector_dot_instr(Decode *s);
+ void permutaion_instr(int opcode, Decode *s);
+ void floating_arithmetic_instr(int opcode, int is_signed, int widening, int dest_mask, Decode *s);
+ void mask_instr(int opcode, Decode *s);

@@ -42,7 +42,7 @@
 
 ## 目录
 
-    docs/      三阶段文档（Markdown，含图表与逐条源码依据）
+    docs/      三阶段文档（Markdown，含图表与逐条源码依据）；docs/pdf/ 为对应 PDF（官网提交版本）
     rtl/       XiangShan 侧改动（xiangshan-vdot.patch + yunsuan-vdot.patch + 新增模块 Vdot32.scala）
     nemu/      NEMU 侧 vdot.vv 实现（patch）
     sw/        测试程序、黄金模型、基线对比程序（cie-vdot / cie-vdot-ill / n1..n6 / cie-vdot-perf）

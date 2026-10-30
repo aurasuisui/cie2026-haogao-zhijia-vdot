@@ -202,7 +202,7 @@ private val outVdotRes = RegEnable(Cat(vdot.io.out.reverse.map(_.asUInt)), io.in
 - **乘法**：16 个 8×8 有符号乘法器，结果 16 位（`s8 × s8` 的值域是 `[-128×-128, 127×127] = [-16256, 16384]`，16 位足够）
 - **加法树**：每组 4 个 16 位乘积，两级加法（2 + 1），中间用 18 位防溢出，最后截断到 32 位
 - **位宽分析**：4 个乘积之和的绝对值上界 `4 × 16384 = 65536 < 2^17`，所以内部 18 位加法不会溢出；最终写入 int32 时按补码截断（语义规定的「自然回绕」）
-- **面积/时序定性**：16 个小乘法器 + 12 个 18 位加法器，在 128 位向量 ALU 的量级里属于小模块；单拍关键路径 = 1 级乘法 + 2 级加法，比现有 `vadd` 的 64 位加法树深，若综合后时序吃紧，预留的降级方案是切成 2 级流水（`Vdot32` 参数化 `piped`）
+- **面积/时序定性**：16 个小乘法器 + 12 个 18 位加法器，在 128 位向量 ALU 的量级里属于小模块；单拍关键路径 = 1 级乘法 + 2 级加法，比现有 `vadd` 的 64 位加法树深，若综合后时序吃紧，降级方案是切成 2 级流水（把 `Vdot32` 的输出再打一拍、`VialuCfg` 的 latency 相应改为 2；本版本未启用，保持单拍组合）
 
 ### 3.6 与既有路径的隔离
 
@@ -211,6 +211,23 @@ private val outVdotRes = RegEnable(Cat(vdot.io.out.reverse.map(_.asUInt)), io.in
 - 不接管 `Mgu`、`Mgtu` 的任何输入；
 - 不改 `VIntFixpAlu64b` 内部对未知 opcode 的处理（`vdot` 的 33 号操作码仍会流进 ALU，但结果被 `Mux` 丢弃）；
 - 因此 `vadd/vsub/vmul/...` 的行为与改动前**逐位一致**，回归测试只需确认原有测试仍通过。
+
+### 3.7 实现代价的量化估算（未综合，按标准单元口径）
+
+评审会问「这条指令值不值」。本节给出可核算的粗估，口径写在表内，**未做综合**（列为后续工作）。
+
+| 资源 | 数量 | 估算依据 | 粗估代价 |
+|---|---|---|---|
+| `s8 × s8 → s16` 有符号乘法器 | 16 | 4 个输出 × 每组 4 个乘积 | 每只约 60–100 个 2 输入 LUT，或 1 个 DSP18；合计 **≈ 1000–1600 LUT 或 16 DSP** |
+| 16/18 位加法器 | 12 | 4 个输出各 3 个（两级加法树：2 + 1） | 约 12 × 16 ≈ 200 个全加器，**≈ 250 LUT** |
+| 32 位选通与截断 | 4 | `reduce(_ +& _)` 后 `pad(32)`，再加 mask/tail 的 Mux | **≈ 150 LUT** |
+| 对齐寄存器 | 130 | `outVdotRes`（128 位）+ `outIsVdot` + `outIsVdotIllegal` | ≈ 130 个触发器 |
+
+**关键路径**：1 级 8×8 乘法（约 3–4 级 LUT）+ 2 级 16/18 位加法（各约 1 级 LUT）≈ **5–6 级 LUT**。同通道的 64 位整数加减/移位本身就有 4–6 级 LUT 的进位链，因此 `vdot` **不引入新的时序瓶颈**，保持 `CertainLatency(1)` 与 `VialuCfg` 一致是安全的；若将来综合报告显示负裕量，按 §3.5 的降级方案切 2 拍即可，**不需要改调度器与写回端口**。
+
+**成本 / 收益比**：基线用标准 RVV 组合实现同一语义约需 13 条指令、十几个 uop（见 §6.1）；`vdot` 用一次 1 拍执行替换掉它们。也就是说，**用约 1500–2000 LUT 的固定开销，换掉 13 条指令的发射与执行占用**。对以 GEMM / attention 为主的边缘 LLM 负载，这笔账随着调用次数摊薄而越算越划算；`vl = 16` 时一次调用消化 16 个 int8（即 4 个 int32 累加结果），正好对齐 int8 量化权重按 16 字节分块的自然粒度。
+
+**为什么不做成 2 拍流水**：`vdot` 的输入依赖紧邻的 `vle8.v`，输出又被紧邻的 `vwadd` 消费；多一拍会把它从「vadd 同级」降到「vmul 同级」（`VimacCfg` 是 2 拍），在依赖链密集的 micro-kernel 里反而更差。单拍 + 组合逻辑是本设计刻意选的甜点。
 
 ---
 
@@ -253,9 +270,29 @@ private val outVdotRes = RegEnable(Cat(vdot.io.out.reverse.map(_.asUInt)), io.in
 3. 写回：`VfWB(1,0)` 端口上的 128 位结果
 4. 对照：同一程序里 `vadd.vv` 的波形（证明通道复用、互不干扰）
 
-### 5.4 当前状态
+### 5.4 实测结果（2026-10-30 回填）
 
-> 本章的测试结果在 RTL 集成完成后回填。已确定的验证流程与阶段一相同（AM 程序 → `build/emu` → 打印结果 → 抓 VCD）。
+RTL 侧（Verilator emu，`--no-diff -C 400000`，程序 `sw/cie-vdot`）：
+
+```
+[group 1] positive
+[group 2] negative
+[group 3] boundary
+=== vdot.vv result: 133 checks, 0 fails -> PASS ===
+Core 0: HIT GOOD TRAP at pc = 0x800008d4
+Core-0 instrCnt = 17765, cycleCnt = 37351, IPC = 0.475623
+```
+
+| 组 | 覆盖内容 | 结果 |
+|---|---|---|
+| 正数 | 全 1..16 与常数相乘、随机正数、`vl ∈ {4,8,16}` | 全 PASS |
+| 负数 | `-128/-1/-127` 与正数混乘、`(-128)×(-128)=65536`、`(-128)×127=-16256` | 全 PASS |
+| 边界 | `0x7F/0x80/0x00`、全零、`vl ∈ {0,1,3,4,5,15,16}`、`vm=0` 掩码组合 × `vta/vma` 四组合、`vstart` 非零 | 全 PASS |
+| 负向（`sw/cie-vdot-ill`） | `vsew=e16`、`vlmul=m2` 必须触发 illegal | `mcause=2`，`mepc` 前进 4，非法指令后继续执行合法路径（`elem0=50=1·1+2·3+3·5+4·7`），PASS |
+
+**三层一致性**：同一份二进制在 NEMU 上也输出 `133 checks, 0 fails`；两者用 difftest 逐条比对时**零 mismatch**（含 32 个向量寄存器，详见阶段三 §4）。因此可以排除「RTL 与语义理解同时错、恰好对上 C 参考模型」的可能。
+
+**波形**：`fuOpType=0x061` 的 `vdot` 与 `vadd.vv` 共用 `exus_2` 通道，生成的 Verilog 中可见 `VIAluFix.sv:677 wire isVdot = io_in_bits_ctrl_fuOpType == 9'h61;`、`VIAluFix.sv:1040 Vdot32 vdot (...)`、`Vdot32.sv:87 module Vdot32(...)`。
 
 ---
 
@@ -263,7 +300,7 @@ private val outVdotRes = RegEnable(Cat(vdot.io.out.reverse.map(_.asUInt)), io.in
 
 ### 6.1 基线：用既有 RVV 指令组合实现等价语义
 
-    # 伪代码，RVV 1.0 下 4 字节一组点积的最小实现（约 5–7 条）
+    # 伪代码，RVV 1.0 下 4 字节一组点积的最小实现（实测算术+配置指令共 10–12 条，见阶段三 §5.1）
     vwmul.vv     v4, vs2, vs1        # 宽乘：e8 × e8 → e16
     vwadd.wv     v8, v8, v4          # 相邻合并 e16 → e32（需要重排配合）
     ...
@@ -278,7 +315,7 @@ private val outVdotRes = RegEnable(Cat(vdot.io.out.reverse.map(_.asUInt)), io.in
 
 ### 6.3 预期结论（待实测）
 
-以「指令条数」为主要口径：`vdot` 用 1 条替代基线 5–7 条，指令数下降 80%+；周期数受发射与写回带宽限制，预计下降幅度小于指令数下降幅度——这个差异本身就是可以写进报告的洞察。
+以「指令条数」为主要口径：`vdot` 用 1 条替代基线 10–12 条（`gat` 12 / `ngt` 10 / `acc` 12，objdump 实数），指令数下降约 90%；周期数受发射与写回带宽限制，下降幅度会小于指令数下降幅度——这个差异正是阶段三要量化的东西（实测见阶段三 §5.3）。
 
 ---
 
@@ -297,10 +334,11 @@ private val outVdotRes = RegEnable(Cat(vdot.io.out.reverse.map(_.asUInt)), io.in
 |---|---|---|
 | 1 | `yunsuan/src/main/scala/yunsuan/encoding/Opcode/VialuOpcode.scala` | 新增 `def vdot = 33.U(width.W)` |
 | 2 | `yunsuan/src/main/scala/yunsuan/package.scala` | `VialuFixType` 新增 `def vdot_vv = LiteralCat(FMT.VVV, SINT, VialuOpcode.vdot)` |
-| 3 | `src/main/scala/xiangshan/backend/decode/Instructions.scala` | 新增 `object Zvdot { val VDOT_VV = BitPat("b100000??????????????????000?????0001011") }` |
-| 4 | `src/main/scala/xiangshan/backend/decode/VecDecoder.scala` | 表内新增 `VDOT_VV -> OPIVV(FuType.vialuF, VialuFixType.vdot_vv, T, F, F)` |
-| 5 | `src/main/scala/xiangshan/backend/fu/vector/Vdot32.scala` | **新增**：点积数据通路（纯组合） |
-| 6 | `src/main/scala/xiangshan/backend/fu/wrapper/VIAluFix.scala` | 新增 `vdot` 支路：点积结果 + 32 位粒度 mask/tail + vtype 校验报 illegal |
+| 3 | `src/main/scala/xiangshan/backend/decode/VecDecoder.scala` | 新增 `val VDOT_VV = BitPat("b100000???????????000?????0001011")`（32 位，其中 `?` 正好 11 个），并在 `opivv` 表首插入 `VDOT_VV -> OPIVV(FuType.vialuF, VialuFixType.vdot_vv, T, F, F)` |
+| 4 | `src/main/scala/xiangshan/backend/fu/vector/Vdot32.scala` | **新增**：点积数据通路（纯组合，35 行） |
+| 5 | `src/main/scala/xiangshan/backend/fu/wrapper/VIAluFix.scala` | 新增 `vdot` 支路：点积结果 + 32 位粒度 mask/tail + vtype 校验报 `illegalInstr` |
+
+> `backend/decode/Instructions.scala` **不需要改**：自定义指令的 `BitPat` 直接写在 `VecDecoder` 里即可，`Instructions.scala` 只用于标准指令的集中定义。
 
 > 注意：`backend/fu/vector/VIAluFix.scala` 与 `backend/fu/wrapper/VIAluFix.scala` **同名但不同文件**，前者是整文件被注释的历史版本，真正生效的是后者（`FuConfig.scala:535` 引用）。
 

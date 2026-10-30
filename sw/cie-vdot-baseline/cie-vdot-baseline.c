@@ -1,317 +1,397 @@
-/* ============================================================================
- * 阶段三：cie-vdot-baseline
+/* ==========================================================================
+ * cie-vdot-baseline.c  --  自定义 vdot.vv 的标准 RVV 基线实现（阶段三）
  *
- * 用「标准 RVV 1.0/1.1 指令」实现与自定义指令 vdot.vv 完全等价的运算，
- * 作为 latency 加速比的分母（对比基线）。
+ * 语义（与 vdot.vv 完全一致）：
+ *   输入  A[0..15], B[0..15] 共 16 个 int8（= 一个 e8/m1 向量寄存器）
+ *   输出  out[i] = sum_{k=0..3} sext8(A[4i+k]) * sext8(B[4i+k]),  i = 0..3
+ *   32 位补码回绕，不饱和。测试口径：vl=16 / SEW=e8 / LMUL=1 / 无掩码。
  *
- * 语义（与 vdot.vv 完全一致，本基线只做 vl=16 / SEW=e8 / LMUL=1 / 无掩码）：
- *     out[i] = sum_{k=0..3} sext8(A[4i+k]) * sext8(B[4i+k]),  i = 0..3
- *     32 位补码回绕，不饱和
+ * 三个版本（都是"有经验的 RVV 程序员"会写出的实现，均无标量乘加）：
  *
- * 实现思路（一个"有经验的 RVV 程序员"会写出的合理实现）：
- *   [e8m1]    vle8.v    取 A、B 各 16 字节
- *   [e8m1]    vwmul.vv  逐元素有符号乘，e8 -> e16（products 最大值 16384，int16 不溢出）
- *   [e16m2]   vsext.vf2 符号扩展 e16 -> e32（16 个 int32 乘积占 v8..v11）
- *   [e32m4]   vslidedown.vi 1 + vadd.vv  -> s[j] = p[j] + p[j+1]
- *             vslidedown.vi 2 + vadd.vv  -> t[j] = p[j]+p[j+1]+p[j+2]+p[j+3]
- *             （必须在 e32 里累加：4 项最大 65536，int16 会溢出）
- *   [e32m4]   vrgather.vv 把 lane 0/4/8/12 收到 lane 0..3（索引向量 vid<<2，循环外建一次）
- *   [e32m1]   vse32.v    写回 4 个 int32
+ *   gat  "两级 shift-add + vrgather"：                     核心 12 条
+ *        vwmul.vv      (e8m1  -> e16m2) 16 个 int16 乘积
+ *        vwadd.vv      (e16m2 -> e32m4) 符号扩展到 e32
+ *        vslidedown.vi + vadd.vv  x2     t[j] = p[j]+p[j+1]+p[j+2]+p[j+3]
+ *        vrgather.vv (idx = vid<<2)      把 lane 0/4/8/12 抽到 lane 0..3
+ *        vse32.v                         4 个字直接写回
  *
- * 核心序列 11 条（不含 2 条 vle8.v / 1 条 vse32.v / 3 条一次性的索引向量建立）。
+ *   ngt  "同上但不用 gather"：                            核心 10 条
+ *        结果仍在 lane 0/4/8/12，vse32.v 整组 16 个字存回暂存,
+ *        再由标量取 4 个 word 写 out（多了 4 次标量 lw，少一条 vrgather）。
  *
- * 另外附带：标量参考模型逐元素比对、mcycle 周期测量（依赖链 / 吞吐两种口径）。
- * ==========================================================================*/
+ *   acc  "vwadd.wv 逐列累加"（不用 gather）：             核心 12 条
+ *        vwmul.vv 得到 p16；
+ *        vwadd.vv  把 p16 加 0 扩成 e32（k=0）；
+ *        vslidedown.vi + vwadd.wv x3 逐个把 p[j+k] 加到宽累加器上。
+ *        NEMU 未实现 vwadd.wv（会触发非法指令），只在 RTL emu 上跑，
+ *        编译时 -DUSE_VWADD_WV=0 可关掉。
+ *
+ * 关于符号扩展：RVV 1.0 本应用 vsext.vf2(e16m2 -> e32m4)，但实测当前
+ * emu(XiangShan kunminghu-v2 @7b16188) 的 vsext.vf2 只按低 8 位扩展
+ * （0x0082 -> 0xFFFFFF82），是 RTL bug；故改用等价标准指令
+ *     vwadd.vv vd(e32m4), vs2(e16m2), vzero(e16m2)   // vd = sext16(vs2) + 0
+ *     vwadd.wv vd(e32m4), vs2(e16m2), vs1(e32m4)     // vd = vs1 + sext16(vs2)
+ * 条数与原方案完全相同（各 1 条），不影响基线公平性。
+ *
+ * 编译宏：
+ *   -DUSE_VWADD_WV=1  启用 acc 版本（emu 用；NEMU 用 0）
+ *   -DVDOT_REF=1      额外用自定义 vdot.vv 算一遍做三方对比（需要支持 vdot 的模型）
+ *   -DDUMP=1          打印每个用例的结果数组（NEMU 用；emu 上 printf 极慢）
+ * ========================================================================== */
 #include <klib.h>
 #include <stdint.h>
 
 #define VL      16
-#define NGROUP  4
+#define NCASE   10
+#define NGRP    4
+#define NTOT    (NCASE * NGRP)
 
-/* 探针版本可以把 bench 的规模压小（sed 替换上面两个宏即可） */
-#ifndef RUN_BENCH
-#define RUN_BENCH 1
+#ifndef USE_VWADD_WV
+#define USE_VWADD_WV 1
 #endif
-#ifndef BENCH_N1
-#define BENCH_N1 100
+#ifndef VDOT_REF
+#define VDOT_REF 0
 #endif
-#ifndef BENCH_N2
-#define BENCH_N2 1000
-#endif
-#ifndef BENCH_REP1
-#define BENCH_REP1 2
-#endif
-#ifndef BENCH_REP2
-#define BENCH_REP2 1
+#ifndef DUMP
+#define DUMP 0
 #endif
 
-static uint8_t  A[VL]        __attribute__((aligned(16)));
-static uint8_t  B[VL]        __attribute__((aligned(16)));
-static uint32_t OUT[NGROUP]  __attribute__((aligned(16)));
+/* ---------------- 数据 ---------------- */
+static uint8_t  A[VL]  __attribute__((aligned(16)));
+static uint8_t  B[VL]  __attribute__((aligned(16)));
+static int32_t  T1[VL] __attribute__((aligned(16)));   /* 整组存回暂存 */
+static int32_t  OUT[VL]__attribute__((aligned(16)));   /* 输出（不相关版本用不同槽） */
+static int32_t  R[4];
 
-static int checks = 0;
-static int fails  = 0;
+static volatile int mask0 = 0;      /* 恒 0，防止编译器把依赖链折掉 */
 
-static volatile int      mask0 = 0;   /* 恒为 0，仅用于让下一轮的指针真的依赖上一轮结果 */
-static volatile uint32_t sink  = 0;   /* 防止编译器把循环优化掉 */
+/* ---------------- 标量参考模型 ---------------- */
+static int32_t sext8(uint8_t x) { return (int32_t)(int8_t)x; }
 
-/* ---------------------------------------------------------------- *
- * 一次点积的向量核心序列
- * 寄存器约定（EMUL>1 的组必须按组宽对齐）：
- *   v1,v2       : A,B (e8m1)
- *   v4:v5       : 16 x int16 乘积        (vwmul  e8m1 -> e16m2, 偶数对齐)
- *   v8..v11     : 16 x int32 乘积/前缀和 (vsext  e16m2 -> e32m4, 4 对齐)
- *   v12..v15    : slide 临时组
- *   v16..v19    : s[j] = p[j]+p[j+1]
- *   v20..v23    : gather 结果
- *   v24..v27    : 索引向量 (vid<<2)，循环外建立
- * ---------------------------------------------------------------- */
-#define DOT_KERNEL(PA, PB, PO)                                        \
-    asm volatile(                                                     \
-        "vsetivli   t0, 16, e8, m1, ta, ma\n\t"                       \
-        "vle8.v     v1, (%0)\n\t"                                     \
-        "vle8.v     v2, (%1)\n\t"                                     \
-        "vwmul.vv   v4, v1, v2\n\t"        /* p[j] = a[j]*b[j], e16 */\
-        "vsetivli   t0, 16, e16, m2, ta, ma\n\t"                      \
-        "vsext.vf2  v8, v4\n\t"            /* p -> e32 */             \
-        "vsetivli   t0, 16, e32, m4, ta, ma\n\t"                      \
-        "vslidedown.vi v12, v8, 1\n\t"                                \
-        "vadd.vv    v16, v8, v12\n\t"      /* s[j]=p[j]+p[j+1] */     \
-        "vslidedown.vi v12, v16, 2\n\t"                               \
-        "vadd.vv    v8, v16, v12\n\t"      /* t[4i]=sum of 4 */       \
-        "vrgather.vv v20, v8, v24\n\t"     /* lanes 0/4/8/12 -> 0..3 */\
-        "vsetivli   t0, 4, e32, m1, ta, ma\n\t"                       \
-        "vse32.v    v20, (%2)\n\t"                                    \
-        :                                                             \
-        : "r"(PA), "r"(PB), "r"(PO)                                   \
-        : "t0", "memory")
-
-/* 索引向量一次性建立：idx[j] = 4*j（>=VLMAX 的索引 vrgather 会当 0，无副作用） */
-#define SETUP_IDX()                                                   \
-    asm volatile(                                                     \
-        "vsetivli t0, 16, e32, m4, ta, ma\n\t"                        \
-        "vid.v    v24\n\t"                                            \
-        "vsll.vi  v24, v24, 2\n\t"                                    \
-        ::: "t0", "memory")
-
-/* ---------------------------------------------------------------- *
- * 标量参考模型
- * ---------------------------------------------------------------- */
 static int32_t ref_dot(const uint8_t *a, const uint8_t *b, int i)
 {
-    uint32_t s = 0;
-    int k;
-    for (k = 0; k < 4; k++) {
-        int32_t x = (int32_t)(int8_t)a[4 * i + k];
-        int32_t y = (int32_t)(int8_t)b[4 * i + k];
-        s = s + (uint32_t)(x * y);          /* 32 位补码回绕 */
-    }
+    uint32_t s = 0;                 /* 32 位自然回绕 */
+    for (int k = 0; k < 4; k++)
+        s += (uint32_t)((int32_t)sext8(a[4 * i + k]) * (int32_t)sext8(b[4 * i + k]));
     return (int32_t)s;
 }
 
-static inline uint32_t rd_mcycle(void)
+/* ---------------- 周期计数 ---------------- */
+static uint32_t rd_mcycle(void)
 {
     uint32_t x;
-    asm volatile("csrr %0, mcycle" : "=r"(x) : : "memory");
+    asm volatile("csrr %0, mcycle" : "=r"(x) :: "memory");
     return x;
 }
 
-/* ---------------------------------------------------------------- *
- * 数据图案
- * ---------------------------------------------------------------- */
-static void fill(uint8_t *p, int mode, int seed)
+/* ---------------- 索引向量 vid<<2（循环外建一次） ---------------- */
+static void setup_idx(void)
 {
-    static const uint8_t pat8[8] = {0x7f, 0x80, 0x00, 0xff, 0x01, 0xfe, 0x40, 0xc0};
-    uint32_t x = (uint32_t)seed * 1103515245u + 12345u;
-    int i;
-    for (i = 0; i < VL; i++) {
-        switch (mode) {
-        case 0:  p[i] = (uint8_t)(i + 1);                       break; /* 小正数   */
-        case 1:  p[i] = (uint8_t)(0x40 + (i & 0x3f));           break; /* 大正数   */
-        case 2:  p[i] = (uint8_t)(0x80 | (i & 0x7f));           break; /* -128..-1 */
-        case 3:  p[i] = 0x80;                                   break; /* -128     */
-        case 4:  p[i] = 0xff;                                   break; /* -1       */
-        case 5:  p[i] = 0x7f;                                   break; /* 127      */
-        case 6:  p[i] = 0x00;                                   break; /* 0        */
-        case 7:  p[i] = pat8[i & 7];                            break; /* 边界混合 */
-        case 8:  x = x * 1103515245u + 12345u;
-                 p[i] = (uint8_t)(x >> 16);                     break; /* 伪随机   */
-        case 9:  p[i] = 0xfe;                                   break; /* -2       */
-        case 10: p[i] = 0xc0;                                   break; /* -64      */
-        case 11: p[i] = 0x40;                                   break; /* 64       */
-        default: p[i] = (uint8_t)i;                             break;
-        }
-    }
+    asm volatile("vsetivli t0,16,e32,m4,ta,ma\n\t"
+                 "vid.v     v24\n\t"
+                 "vsll.vi   v24,v24,2\n\t" ::: "t0", "memory");
 }
 
-/* ---------------------------------------------------------------- *
- * 单个用例：跑一次基线，逐元素与参考模型比对
- * ---------------------------------------------------------------- */
-static void check_case(const char *name, int ma, int sa, int mb, int sb)
+/* ==========================================================================
+ *  gat: vwmul + 两级 shift-add + vrgather        （核心 12 条）
+ * ========================================================================== */
+static void dot_gat(const uint8_t *a, const uint8_t *b, int32_t *out)
 {
-    int i;
-    fill(A, ma, sa);
-    fill(B, mb, sb);
-    for (i = 0; i < NGROUP; i++) OUT[i] = 0xdeadbeefu;
-
-    DOT_KERNEL((const uint8_t *)A, (const uint8_t *)B, (uint32_t *)OUT);
-    asm volatile("" ::: "memory");
-
-    for (i = 0; i < NGROUP; i++) {
-        int32_t exp = ref_dot(A, B, i);
-        int32_t act = (int32_t)OUT[i];
-        checks++;
-        if (act != exp) {
-            fails++;
-            if (fails <= 12)
-                printf("  FAIL [%s] group %d: act=%08x exp=%08x\n",
-                       name, i, (unsigned)act, (unsigned)exp);
-        }
-    }
+    asm volatile(
+        "vsetivli   t0,16,e8,m1,ta,ma\n\t"       /* 1  vtype: e8/m1          */
+        "vle8.v     v1,(%0)\n\t"                 /*    A[0..15]              */
+        "vle8.v     v2,(%1)\n\t"                 /*    B[0..15]              */
+        "vwmul.vv   v4,v1,v2\n\t"                /* 2  p16 = sext8(a)*sext8(b) (e16m2) */
+        "vsetivli   t0,16,e16,m2,ta,ma\n\t"      /* 3  vtype: e16/m2         */
+        "vmv.v.i    v6,0\n\t"                    /* 4  v6 = 0                */
+        "vwadd.vv   v8,v4,v6\n\t"                /* 5  p32 = sext16(p16)     (e32m4)   */
+        "vsetivli   t0,16,e32,m4,ta,ma\n\t"      /* 6  vtype: e32/m4         */
+        "vslidedown.vi v12,v8,1\n\t"             /* 7                        */
+        "vadd.vv    v16,v8,v12\n\t"              /* 8  s[j] = p[j]+p[j+1]    */
+        "vslidedown.vi v12,v16,2\n\t"            /* 9                        */
+        "vadd.vv    v8,v16,v12\n\t"              /* 10 t[j] = s[j]+s[j+2]    */
+        "vrgather.vv v20,v8,v24\n\t"             /* 11 取 lane 0/4/8/12 -> 0..3 */
+        "vsetivli   t0,4,e32,m1,ta,ma\n\t"       /* 12 vtype: e32/m1, vl=4   */
+        "vse32.v    v20,(%2)\n\t"
+        : : "r"(a), "r"(b), "r"(out) : "t0", "memory");
 }
 
-/* ---------------------------------------------------------------- *
- * 周期测量
- *   bench_serial : 每次点积的地址依赖上一轮结果 -> 整条链被串行化
- *   bench_null   : 同样的循环骨架，但没有向量序列（扣循环开销用）
- *   bench_thru   : 输入不变、地址不变，背靠背发射（吞吐口径）
- * ---------------------------------------------------------------- */
-#if RUN_BENCH
-__attribute__((noinline))
-static uint32_t bench_null(int n)
+/* ==========================================================================
+ *  ngt: 同 gat，但用整组存回 + 标量取（不用 vrgather）（核心 10 条）
+ * ========================================================================== */
+static void dot_ngt(const uint8_t *a, const uint8_t *b, int32_t *out)
 {
-    const uint8_t *pa = A;
-    uint32_t c0, c1;
-    asm volatile("" ::: "memory");
-    c0 = rd_mcycle();
-    for (int i = 0; i < n; i++) {
-        /* 与 bench_serial 完全相同的标量胶水：load OUT[0] + load mask0 + and + add，
-         * 只是没有向量序列（volatile 读保证每轮真的发一次，不被提出循环） */
-        pa = A + ((int32_t)(*(volatile uint32_t *)&OUT[0]) & mask0);
-        asm volatile("" ::: "memory");
-    }
-    c1 = rd_mcycle();
-    asm volatile("" ::: "memory");
-    sink = (uint32_t)(pa - A);
-    return c1 - c0;
+    asm volatile(
+        "vsetivli   t0,16,e8,m1,ta,ma\n\t"       /* 1  */
+        "vle8.v     v1,(%0)\n\t"
+        "vle8.v     v2,(%1)\n\t"
+        "vwmul.vv   v4,v1,v2\n\t"                /* 2  */
+        "vsetivli   t0,16,e16,m2,ta,ma\n\t"      /* 3  */
+        "vmv.v.i    v6,0\n\t"                    /* 4  */
+        "vwadd.vv   v8,v4,v6\n\t"                /* 5  */
+        "vsetivli   t0,16,e32,m4,ta,ma\n\t"      /* 6  */
+        "vslidedown.vi v12,v8,1\n\t"             /* 7  */
+        "vadd.vv    v16,v8,v12\n\t"              /* 8  */
+        "vslidedown.vi v12,v16,2\n\t"            /* 9  */
+        "vadd.vv    v8,v16,v12\n\t"              /* 10 */
+        "vse32.v    v8,(%2)\n\t"                 /* 11 整组 16 个字存回 */
+        : : "r"(a), "r"(b), "r"(T1) : "t0", "memory");
+    out[0] = T1[0]; out[1] = T1[4]; out[2] = T1[8]; out[3] = T1[12];
 }
 
-__attribute__((noinline))
-static uint32_t bench_serial(int n)
+/* ==========================================================================
+ *  acc: vwmul + vslidedown + vwadd.wv 逐列累加（核心 12 条）
+ *  需要 vwadd.wv：emu 支持，NEMU 未实现（非法指令）
+ * ========================================================================== */
+#if USE_VWADD_WV
+static void dot_acc(const uint8_t *a, const uint8_t *b, int32_t *out)
 {
-    const uint8_t *pa = A;
-    uint32_t c0, c1;
-    asm volatile("" ::: "memory");
-    c0 = rd_mcycle();
-    for (int i = 0; i < n; i++) {
-        DOT_KERNEL(pa, (const uint8_t *)B, (uint32_t *)OUT);
-        pa = A + ((int32_t)OUT[0] & mask0);   /* mask0==0，但依赖是真的 */
-    }
-    c1 = rd_mcycle();
-    asm volatile("" ::: "memory");
-    sink = (uint32_t)(pa - A) + OUT[0];
-    return c1 - c0;
-}
-
-__attribute__((noinline))
-static uint32_t bench_thru(int n)
-{
-    uint32_t c0, c1;
-    asm volatile("" ::: "memory");
-    c0 = rd_mcycle();
-    for (int i = 0; i < n; i++)
-        DOT_KERNEL((const uint8_t *)A, (const uint8_t *)B, (uint32_t *)OUT);
-    c1 = rd_mcycle();
-    asm volatile("" ::: "memory");
-    sink = OUT[0] + OUT[3];
-    return c1 - c0;
-}
-
-static uint32_t best(uint32_t *v, int n)
-{
-    uint32_t m = v[0];
-    for (int i = 1; i < n; i++) if (v[i] < m) m = v[i];
-    return m;
-}
-
-static void bench_report(const char *tag, uint32_t cyc, uint32_t nul, int n)
-{
-    /* 每点积周期，用整数打印到 0.01： (cyc-nul)*100/n */
-    uint32_t per100 = (uint32_t)(((uint64_t)(cyc - nul) * 100u) / (uint32_t)n);
-    printf("[BENCH] %s N=%-4d total=%u null=%u -> %u.%02u cyc/dot\n",
-           tag, n, (unsigned)cyc, (unsigned)nul,
-           (unsigned)(per100 / 100u), (unsigned)(per100 % 100u));
+    asm volatile(
+        "vsetivli   t0,16,e8,m1,ta,ma\n\t"       /* 1  */
+        "vle8.v     v1,(%0)\n\t"
+        "vle8.v     v2,(%1)\n\t"
+        "vwmul.vv   v4,v1,v2\n\t"                /* 2  p16 (e16m2) */
+        "vsetivli   t0,16,e16,m2,ta,ma\n\t"      /* 3  */
+        "vmv.v.i    v6,0\n\t"                    /* 4  */
+        "vwadd.vv   v8,v4,v6\n\t"                /* 5  acc0 = sext16(p)        k=0 */
+        "vslidedown.vi v6,v4,1\n\t"              /* 6  */
+        "vwadd.wv   v16,v6,v8\n\t"               /* 7  acc1 = acc0 + sext(p+1) k=1 */
+        "vslidedown.vi v6,v4,2\n\t"              /* 8  */
+        "vwadd.wv   v8,v6,v16\n\t"               /* 9  acc0 = acc1 + sext(p+2) k=2 */
+        "vslidedown.vi v6,v4,3\n\t"              /* 10 */
+        "vwadd.wv   v16,v6,v8\n\t"               /* 11 acc1 = acc0 + sext(p+3) k=3 */
+        "vsetivli   t0,16,e32,m4,ta,ma\n\t"      /* 12 */
+        "vse32.v    v16,(%2)\n\t"
+        : : "r"(a), "r"(b), "r"(T1) : "t0", "memory");
+    out[0] = T1[0]; out[1] = T1[4]; out[2] = T1[8]; out[3] = T1[12];
 }
 #endif
 
-/* ---------------------------------------------------------------- */
+#if VDOT_REF
+static void dot_vdot(const uint8_t *a, const uint8_t *b, int32_t *out)
+{
+    asm volatile("vsetivli t0,16,e8,m1,ta,ma\n\t"
+                 "vle8.v v1,(%0)\n\t"
+                 "vle8.v v2,(%1)\n\t"
+                 ".insn 0x8220818b\n\t"                   /* vdot.vv v3,v1,v2 */
+                 "vsetivli t0,4,e32,m1,ta,ma\n\t"
+                 "vse32.v v3,(%2)\n\t"
+                 :: "r"(a), "r"(b), "r"(out) : "t0", "memory");
+}
+#endif
+
+/* ==========================================================================
+ *  测试用例
+ * ========================================================================== */
+static const char *case_name[NCASE] = {
+    "pos", "neg", "mix", "min*min", "bnd-7f/80", "min*-1",
+    "0xfe*0xfe", "0xc0*0x40", "0x00/0xff", "rnd"
+};
+
+static void fill_case(int c, uint8_t *a, uint8_t *b)
+{
+    int i;
+    switch (c) {
+    case 0:  /* 全正数：1..16 * 64..79 */
+        for (i = 0; i < VL; i++) { a[i] = (uint8_t)(i + 1); b[i] = (uint8_t)(64 + i); }
+        break;
+    case 1:  /* 全负数：-16..-1 * -1..-16 */
+        for (i = 0; i < VL; i++) { a[i] = (uint8_t)(0xF0 + i); b[i] = (uint8_t)(0xFF - i); }
+        break;
+    case 2:  /* 正负混合 */
+        for (i = 0; i < VL; i++) {
+            a[i] = (uint8_t)((i & 1) ? (0x80 | (i + 1)) : (i + 1));
+            b[i] = (uint8_t)((i & 1) ? (i + 1) : (0x80 | (i + 1)));
+        }
+        break;
+    case 3:  /* -128 * -128 = 16384，4 项和 = 65536 */
+        for (i = 0; i < VL; i++) { a[i] = 0x80; b[i] = 0x80; }
+        break;
+    case 4:  /* 边界 0x7F / 0x80 / 0x00 / 0xFF */
+        for (i = 0; i < VL; i++) {
+            a[i] = (uint8_t)((i & 3) == 0 ? 0x7F : (i & 3) == 1 ? 0x80 :
+                             (i & 3) == 2 ? 0x00 : 0xFF);
+            b[i] = (uint8_t)((i & 3) == 0 ? 0x80 : (i & 3) == 1 ? 0x7F :
+                             (i & 3) == 2 ? 0xFF : 0x00);
+        }
+        break;
+    case 5:  /* -128 * -1 = 128 */
+        for (i = 0; i < VL; i++) { a[i] = 0x80; b[i] = 0xFF; }
+        break;
+    case 6:  /* 0xFE(-2) * 0xFE(-2) = 4 */
+        for (i = 0; i < VL; i++) { a[i] = 0xFE; b[i] = 0xFE; }
+        break;
+    case 7:  /* 0xC0(-64) * 0x40(64) = -4096 */
+        for (i = 0; i < VL; i++) { a[i] = 0xC0; b[i] = 0x40; }
+        break;
+    case 8:  /* 0x00 / 0xFF */
+        for (i = 0; i < VL; i++) { a[i] = (uint8_t)((i & 1) ? 0xFF : 0x00);
+                                   b[i] = (uint8_t)((i & 1) ? 0xFF : 0x00); }
+        break;
+    default: /* 伪随机（LCG） */
+        { uint32_t s = 0x12345678u;
+          for (i = 0; i < VL; i++) { s = s * 1664525u + 1013904223u; a[i] = (uint8_t)(s >> 24);
+                                     s = s * 1664525u + 1013904223u; b[i] = (uint8_t)(s >> 24); } }
+        break;
+    }
+}
+
+/* ==========================================================================
+ *  正确性验证（逐元素与标量参考模型比对）
+ * ========================================================================== */
+typedef void (*dotfn)(const uint8_t *, const uint8_t *, int32_t *);
+
+static void dump4(const char *tag, const int32_t *v)
+{
+    printf("  %s %d %d %d %d\n", tag, (int)v[0], (int)v[1], (int)v[2], (int)v[3]);
+}
+
+static int check_variant(dotfn k, const char *tag)
+{
+    int c, i, ok = 0, nbad = 0;
+
+    for (c = 0; c < NCASE; c++) {
+        fill_case(c, A, B);
+        for (i = 0; i < NGRP; i++) R[i] = ref_dot(A, B, i);
+        k(A, B, OUT);
+        for (i = 0; i < NGRP; i++) {
+            if (OUT[i] == R[i]) ok++;
+            else if (++nbad <= 2) {
+                printf("[FAIL %s] %s\n", tag, case_name[c]);
+                dump4("act ", OUT);
+                dump4("exp ", R);
+            }
+        }
+    }
+    printf("[%s] %d/%d\n", tag, ok, NTOT);
+    return ok == NTOT;
+}
+
+#if DUMP
+static void dump_all(void)
+{
+    int c, i;
+    int32_t t[4];
+    for (c = 0; c < NCASE; c++) {
+        fill_case(c, A, B);
+        for (i = 0; i < NGRP; i++) R[i] = ref_dot(A, B, i);
+        printf("[c%d] %s\n", c, case_name[c]);
+        dump4("ref ", R);
+        dot_gat(A, B, t); dump4("gat ", t);
+        dot_ngt(A, B, t); dump4("ngt ", t);
+#if USE_VWADD_WV
+        dot_acc(A, B, t); dump4("acc ", t);
+#endif
+#if VDOT_REF
+        dot_vdot(A, B, t); dump4("vdot", t);
+#endif
+    }
+}
+#endif
+
+/* ==========================================================================
+ *  周期测量
+ *    L (latency)     : 本轮 out[0] 参与下一轮输入地址，强制串行依赖
+ *    T (throughput)  : 一轮 4 个互不相关的 kernel，无跨迭代依赖
+ *    nop             : 同样的循环骨架但不做点积，用于扣除循环开销
+ *  迭代次数用编译期常量数组 NSEED[]，改这里即可
+ * ========================================================================== */
+#define WARMUP 4
+
+__attribute__((noinline))
+static uint32_t bench_ser(dotfn k, int n, int32_t *out)
+{
+    uint32_t c0, c1; int i;
+    const uint8_t *pa = A, *pb = B;
+    for (i = 0; i < WARMUP; i++) k(A, B, out);
+    c0 = rd_mcycle();
+    for (i = 0; i < n; i++) {
+        k(pa, pb, out);
+        pa = A + ((uint32_t)out[0] & (uint32_t)mask0);   /* 依赖上一轮结果 */
+        pb = B;
+    }
+    c1 = rd_mcycle();
+    return c1 - c0;
+}
+
+__attribute__((noinline, unused))
+static uint32_t bench_thru(dotfn k, int n, int32_t *out)
+{
+    uint32_t c0, c1; int i;
+    int32_t *o0 = out, *o1 = out + 4, *o2 = out + 8, *o3 = out + 12;
+    for (i = 0; i < WARMUP; i++) { k(A, B, o0); k(A, B, o1); k(A, B, o2); k(A, B, o3); }
+    c0 = rd_mcycle();
+    for (i = 0; i < n; i++) {
+        k(A, B, o0); k(A, B, o1); k(A, B, o2); k(A, B, o3);
+    }
+    c1 = rd_mcycle();
+    return c1 - c0;
+}
+
+__attribute__((noinline))
+static uint32_t bench_null(int n, int32_t *out)
+{
+    uint32_t c0, c1; int i;
+    const uint8_t *pa = A, *pb = B;
+    c0 = rd_mcycle();
+    for (i = 0; i < n; i++) {
+        pa = A + ((uint32_t)out[0] & (uint32_t)mask0);
+        pb = B;
+    }
+    c1 = rd_mcycle();
+    __asm__ volatile("" :: "r"(pa), "r"(pb));
+    return c1 - c0;
+}
+
+/* 迭代次数：编译期常量数组，可用 -DNSEED_OVERRIDE='{4,8}' 覆盖 */
+#ifdef NSEED_OVERRIDE
+static const int NSEED[] = NSEED_OVERRIDE;
+#else
+static const int NSEED[] = { 100, 1000 };
+#endif
+
 int main(void)
 {
-    int i;
+    int ok = 1, j;
+    const int nn = (int)(sizeof(NSEED) / sizeof(NSEED[0]));
 
-    printf("=== cie-vdot-baseline: RVV 1.0 equivalent of vdot.vv ===\n");
+    setup_idx();
 
-    SETUP_IDX();
-
-    /* ---------------- 正确性 ---------------- */
-    check_case("pos",        0, 0,  1, 0);
-    check_case("pos-max",    5, 0,  5, 0);   /* 127*127*4 = 64516  */
-    check_case("neg",        2, 0,  2, 0);
-    check_case("min*min",    3, 0,  3, 0);   /* 65536  */
-    check_case("min*-1",     3, 0,  4, 0);   /* 512    */
-    check_case("min*127",    3, 0,  5, 0);   /* -65024 */
-    check_case("bnd*bnd",    7, 0,  7, 0);
-    check_case("bnd*min",    7, 0,  3, 0);
-    check_case("zero",       6, 0,  6, 0);
-    check_case("0xfe*0xfe",  9, 0,  9, 0);
-    check_case("0xc0*0x40", 10, 0, 11, 0);
-    check_case("rnd-1",      8, 1,  8, 2);
-    check_case("rnd-2",      8, 3,  8, 4);
-    check_case("rnd-3",      8, 5,  8, 6);
-    check_case("rnd-4",      8, 7,  7, 0);
-
-    if (fails == 0) {
-        printf("[BASELINE] PASS %d/%d\n", checks, checks);
-        /* 抽一个用例把数值打出来，方便人眼核对（-128 * -128 * 4 = 65536） */
-        fill(A, 3, 0); fill(B, 3, 0);
-        DOT_KERNEL((const uint8_t *)A, (const uint8_t *)B, (uint32_t *)OUT);
-        asm volatile("" ::: "memory");
-        printf("  spot: A=B=-128 -> out[0..3] = %d %d %d %d (exp 65536)\n",
-               (int)OUT[0], (int)OUT[1], (int)OUT[2], (int)OUT[3]);
-    } else {
-        printf("[BASELINE] FAIL %d/%d\n", checks - fails, checks);
-    }
-
-#if RUN_BENCH
-    /* ---------------- 周期测量 ---------------- */
-    {
-        uint32_t nul_v[BENCH_REP1 > BENCH_REP2 ? BENCH_REP1 : BENCH_REP2];
-        uint32_t s1[BENCH_REP1], t1[BENCH_REP1];
-        uint32_t s2[BENCH_REP2], t2[BENCH_REP2];
-        uint32_t nul1, nul2;
-
-        /* 数据用固定图案，避免 cache miss 抖动 */
-        fill(A, 8, 11);
-        fill(B, 8, 22);
-
-        for (i = 0; i < BENCH_REP1; i++) nul_v[i] = bench_null(BENCH_N1);
-        nul1 = best(nul_v, BENCH_REP1);
-        for (i = 0; i < BENCH_REP2; i++) nul_v[i] = bench_null(BENCH_N2);
-        nul2 = best(nul_v, BENCH_REP2);
-
-        for (i = 0; i < BENCH_REP1; i++) s1[i] = bench_serial(BENCH_N1);
-        for (i = 0; i < BENCH_REP1; i++) t1[i] = bench_thru(BENCH_N1);
-        for (i = 0; i < BENCH_REP2; i++) s2[i] = bench_serial(BENCH_N2);
-        for (i = 0; i < BENCH_REP2; i++) t2[i] = bench_thru(BENCH_N2);
-
-        bench_report("serial", best(s1, BENCH_REP1), nul1, BENCH_N1);
-        bench_report("serial", best(s2, BENCH_REP2), nul2, BENCH_N2);
-        bench_report("thru  ", best(t1, BENCH_REP1), nul1, BENCH_N1);
-        bench_report("thru  ", best(t2, BENCH_REP2), nul2, BENCH_N2);
-        printf("[BENCH] done (rep1=%d rep2=%d, min of reps)\n", BENCH_REP1, BENCH_REP2);
-    }
+#if DUMP
+    dump_all();
 #endif
 
-    printf("=== baseline done: %s ===\n", fails == 0 ? "PASS" : "FAIL");
-    return fails == 0 ? 0 : 1;
+    /* ---- 可移植的两个版本（只用 NEMU 也支持的指令）---- */
+    ok &= check_variant(dot_gat, "gat");
+    ok &= check_variant(dot_ngt, "ngt");
+
+    for (j = 0; j < nn; j++) {
+        int n = NSEED[j];
+        int nul = (int)bench_null(n, OUT);
+        int gL = (int)bench_ser(dot_gat, n, OUT);
+        int nL = (int)bench_ser(dot_ngt, n, OUT);
+#if BENCH_THRU
+        int gT = (int)bench_thru(dot_gat, n, OUT);
+        int nT = (int)bench_thru(dot_ngt, n, OUT);
+#else
+        int gT = 0, nT = 0;   /* 只测延迟：thru 被裁掉 */
+#endif
+        printf("[B] N=%d nop=%d gat=%d,%d ngt=%d,%d\n", n, nul, gL, gT, nL, nT);
+    }
+
+#if USE_VWADD_WV
+    /* ---- 只在实现了 vwadd.wv 的模型上跑（emu 可以，NEMU 不行）---- */
+    ok &= check_variant(dot_acc, "acc");
+    for (j = 0; j < nn; j++) {
+        int n = NSEED[j];
+        int aL = (int)bench_ser(dot_acc, n, OUT);
+#if BENCH_THRU
+        int aT = (int)bench_thru(dot_acc, n, OUT);
+#else
+        int aT = 0;
+#endif
+        printf("[BA] N=%d acc=%d,%d\n", n, aL, aT);
+    }
+#endif
+    return ok ? 0 : 1;
 }

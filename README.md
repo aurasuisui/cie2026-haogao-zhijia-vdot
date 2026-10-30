@@ -10,7 +10,7 @@
 |---|---|---|
 | 阶段一 · 环境部署与向量指令波形分析（15 分） | 环境部署日志、`hello xiangshan` 输出、`vadd.vv` 逐拍波形分析 | [docs/01-环境部署与指令波形分析.md](docs/01-环境部署与指令波形分析.md) |
 | 阶段二 · 自定义 `vdot.vv` 指令设计（20 分） | 设计文档、RTL 实现、正/负/边界三组测试 | [docs/02-vdot设计与实现.md](docs/02-vdot设计与实现.md)、[rtl/](rtl/) |
-| 阶段三 · NEMU 与软硬件协同仿真（25 分） | NEMU 功能模型、NEMU-RTL 协同仿真、基线对比与加速比分析 | [docs/03-NEMU与协同仿真.md](docs/03-NEMU与协同仿真.md)、[nemu/](nemu/) |
+| 阶段三 · NEMU 与软硬件协同仿真（25 分） | NEMU 功能模型、NEMU-RTL 协同仿真、基线对比与加速比分析 | [docs/03-协同仿真与性能分析.md](docs/03-协同仿真与性能分析.md)、[nemu/](nemu/)、[sw/](sw/) |
 
 ## 指令速览
 
@@ -30,19 +30,22 @@
     sudo -s ./setup-tools.sh && source setup.sh
     source ./env.sh
 
-    # 2) 打上本仓库的 RTL 改动
-    cd $NOOP_HOME && git apply /path/to/rtl/vdot.patch
+    # 2) 打上本仓库的 RTL 改动（两个仓库分别打）
+    cd $NOOP_HOME && git apply /path/to/rtl/xiangshan-vdot.patch
+    cd $NOOP_HOME/yunsuan && git apply /path/to/rtl/yunsuan-vdot.patch
+    cd $NOOP_HOME && git submodule status yunsuan    # 确认子模块指针已更新
 
-    # 3) 构建仿真器并跑测试
+    # 3) 构建仿真器，跑三组功能测试与非法指令测试
     make emu -j16
-    ./build/emu -i apps/vdot-test/build/vdot-test-riscv64-xs.bin
+    ./build/emu -i $AM_HOME/apps/cie-vdot/build/cie-vdot-riscv64-xs.bin
+    ./build/emu -i $AM_HOME/apps/cie-vdot-ill/build/cie-vdot-ill-riscv64-xs.bin
 
 ## 目录
 
     docs/      三阶段文档（Markdown，含图表与逐条源码依据）
-    rtl/       XiangShan 侧改动（patch + 新增模块 Vdot32.scala）
+    rtl/       XiangShan 侧改动（xiangshan-vdot.patch + yunsuan-vdot.patch + 新增模块 Vdot32.scala）
     nemu/      NEMU 侧 vdot.vv 实现（patch）
-    sw/        测试程序、黄金模型、基线对比程序
+    sw/        测试程序、黄金模型、基线对比程序（cie-vdot / cie-vdot-ill / n1..n6 / cie-vdot-perf）
     scripts/   一键复现脚本
 
 ## 许可证

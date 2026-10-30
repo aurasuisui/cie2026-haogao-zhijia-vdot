@@ -30,15 +30,18 @@
     sudo -s ./setup-tools.sh && source setup.sh
     source ./env.sh
 
-    # 2) 打上本仓库的 RTL 改动（两个仓库分别打）
+    # 2) 打补丁 + 构建 + 跑测试（脚本里也可一步步手动执行）
+    bash scripts/apply-patches.sh ~/xs-env      # XiangShan 3 个文件 + YunSuan 2 个文件
+    bash scripts/build-emu.sh    ~/xs-env 16    # ~30 分钟，日志 build/emu-vdot.log
+    bash scripts/run-tests.sh    ~/xs-env       # 6 组功能测试 + illegal 用例
+    bash scripts/run-tests.sh    ~/xs-env --diff ~/xs-env/NEMU/build/riscv64-nemu-interpreter-so
+    bash scripts/reproduce-perf.sh ~/xs-env     # 统一性能测量（约 15 分钟）
+
+    手动等价命令：
     cd $NOOP_HOME && git apply /path/to/rtl/xiangshan-vdot.patch
     cd $NOOP_HOME/yunsuan && git apply /path/to/rtl/yunsuan-vdot.patch
-    cd $NOOP_HOME && git submodule status yunsuan    # 确认子模块指针已更新
-
-    # 3) 构建仿真器，跑三组功能测试与非法指令测试
-    make emu -j16
-    ./build/emu -i $AM_HOME/apps/cie-vdot/build/cie-vdot-riscv64-xs.bin
-    ./build/emu -i $AM_HOME/apps/cie-vdot-ill/build/cie-vdot-ill-riscv64-xs.bin
+    cd $NOOP_HOME && make emu -j16
+    ./build/emu -i $AM_HOME/apps/cie-vdot/build/cie-vdot-riscv64-xs.bin --no-diff -C 400000
 
 ## 目录
 
@@ -46,7 +49,7 @@
     rtl/       XiangShan 侧改动（xiangshan-vdot.patch + yunsuan-vdot.patch + 新增模块 Vdot32.scala）
     nemu/      NEMU 侧 vdot.vv 实现（patch）
     sw/        测试程序、黄金模型、基线对比程序（cie-vdot / cie-vdot-ill / n1..n6 / cie-vdot-perf）
-    scripts/   一键复现脚本
+    scripts/   一键复现脚本（apply-patches.sh / build-emu.sh / run-tests.sh / reproduce-perf.sh）
 
 ## 许可证
 

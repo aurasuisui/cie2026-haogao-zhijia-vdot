@@ -16,13 +16,14 @@ make -C $AM_HOME/apps/cie-vdot ARCH=riscv64-xs  # 产物 build/cie-vdot-riscv64-
 | `cie-vdot-perf/` | **统一测量框架**：同一二进制内依次测三个基线与 `vdot`，同一套 `bench_ser`/`bench_thru`/`bench_null`，内嵌 `vdot` 功能自检 | 同上（见文末输出样例） |
 | `cie-vdot/` | 阶段二主测试：正数 / 负数 / 边界三组 + `vstart`/`vmask` 组合，133 checks | `emu -i .../cie-vdot-riscv64-xs.bin --no-diff -C 40000` |
 | `cie-vdot-ill/` | 负向测试：`vsew=e16` 必须触发 illegal instruction（自带 M-mode trap handler） | 同上 |
+| `cie-hello/` | 阶段一的 `hello xiangshan, I am xxx, IP` 程序（姓名与 IP 在 Makefile 里编译期注入）与本机实跑日志 | `emu -i .../cie-hello-riscv64-xs.bin --no-diff -C 40000` |
 | `cie-vdot-n1-pos/` … `n6-illegal/` | 六个分项测试（正数、负数、vl 扫描、mask/tail 矩阵、vstart 重启、非法指令），供 difftest 分组比对 | `emu -i ...bin -C 1500000 --diff=$NEMU_HOME/build/riscv64-nemu-interpreter-so` |
 
 ## 编译期开关（`cie-vdot-baseline` / `cie-vdot-perf` 的 Makefile）
 
 | 宏 | 默认 | 说明 |
 |---|---|---|
-| `USE_VWADD_WV` | 0 | 1 = 启用 `acc` 变体。**本仓库默认 0**：该变体在本机 emu 上会挂死（见 `docs/03` §6.4），挂死与 vdot 本身的正确性无关 |
+| `USE_VWADD_WV` | 0 | 1 = 启用 `acc` 变体。**本仓库默认 0**：该变体在本机 emu 上会挂死（见 `docs/03` §6.5），挂死与 vdot 本身的正确性无关 |
 | `BENCH_THRU` | 1 | 1 = 同时跑「4 条互不依赖的链」的吞吐口径 |
 | `VDOT_REF` | 0 | 1 = 把 vdot 也纳入功能对拍（需要含 vdot 的 RTL/NEMU） |
 | `DUMP` | 0 | 1 = 打印前 4 个用例的输入/输出，便于人工核对 |

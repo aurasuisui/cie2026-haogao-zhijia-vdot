@@ -1,0 +1,10 @@
+emu compiled at Oct 30 2026, 23:26:29
+[INFO] init for constantin: loaded from init.
+hello xiangshan, I am xujiabao (haogao-zhijia), 172.23.155.128
+Core  0's Commit SHA is: 7b16188f7f, dirty: 1
+Using simulated 8386560MB RAM
+The image is /home/aura/xs-env/nexus-am/apps/cie-hello/build/cie-hello-riscv64-xs.bin
+Core 0: HIT GOOD TRAP at pc = 0x80000164
+Core-0 instrCnt = 1862, cycleCnt = 14988, IPC = 0.124233
+Seed=0 Guest cycle spent: 14994 (this will be different from cycleCnt if emu loads a snapshot)
+Host time spent: 76183ms

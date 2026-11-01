@@ -55,7 +55,7 @@ static void expect_illegal(const char *tag, int kind, size_t avl)
     case 1: asm volatile("vsetvli x0, %0, e8, m2, ta, ma" : : "r"((long)avl)); break;
     default: asm volatile("vsetvli x0, %0, e8, m1, ta, ma" : : "r"((long)avl)); break;
   }
-  asm volatile(".insn 0x8220818b" ::: "memory");     /* vdot.vv v3, v1, v2 (vm=1) */
+  asm volatile(".insn 0x8220818b" ::: "memory");     /* vdot.vv v3, v2, v1 (vm=1) */
   int traps = (int)(t_count - before);
   int ok = (traps == 1) && (t_cause == 2);
   g_checks++;

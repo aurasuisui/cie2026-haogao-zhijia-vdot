@@ -173,7 +173,7 @@ static void dot_vdot(const uint8_t *a, const uint8_t *b, int32_t *out)
     asm volatile("vsetivli t0,16,e8,m1,ta,ma\n\t"
                  "vle8.v v1,(%0)\n\t"
                  "vle8.v v2,(%1)\n\t"
-                 ".insn 0x8220818b\n\t"                   /* vdot.vv v3,v1,v2 */
+                 ".insn 0x8220818b\n\t"                   /* vdot.vv v3,v2,v1 */
                  "vsetivli t0,4,e32,m1,ta,ma\n\t"
                  "vse32.v v3,(%2)\n\t"
                  :: "r"(a), "r"(b), "r"(out) : "t0", "memory");

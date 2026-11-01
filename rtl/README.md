@@ -44,7 +44,7 @@ vdot.vv vd, vs2, vs1        # vd.e32[i] = Σ_{k=0..3} sext8(vs2[4i+k]) * sext8(v
 
 `enc = (funct7 << 25) | (vs2 << 20) | (vs1 << 15) | (funct3 << 12) | (vd << 7) | 0x0B`，`funct7 = 100000<vm>`，`funct3 = 000`。
 
-| 形式 | 机器码（`vdot.vv v3, v1, v2`） |
+| 形式 | 机器码（`vdot.vv v3, v2, v1`） |
 |---|---|
 | `vm = 1`（不掩码） | `0x8220818b` |
 | `vm = 0`（用 v0 掩码） | `0x8020818b` |

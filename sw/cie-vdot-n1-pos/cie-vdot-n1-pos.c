@@ -2,7 +2,7 @@
  *
  * 被测指令: vdot.vv vd, vs2, vs1
  *   编码: opcode=0x0B (custom-0), funct6=100000, funct3=000, vm=funct7[0]
- *   机器码: 0x8220818b (vm=1) / 0x8020818b (vm=0), rd=v3, rs1=v2, rs2=v1
+ *   机器码: 0x8220818b (vm=1) / 0x8020818b (vm=0), rd=v3, rs1=v1, rs2=v2
  *   语义: vd.e32[i] = sum_{k=0..3} sext8(vs2[4i+k]) * sext8(vs1[4i+k]), 32 位回绕, 无饱和/无 vxsat
  *   前置: vsew=e8, vlmul=m1, vl<=16, vill=0
  *   mask: 元素 i (e32 下标) 由 v0[i] 控制; vstart 按源字节计, i*4 < vstart 的元素保持旧值
@@ -109,8 +109,8 @@ static void run_nemu(size_t vl, int vm, int vta, int vma, uint32_t vstart)
     default: asm volatile("vsetvli x0, %0, e8, m1, ta, ma" : : "r"((long)vl)); break;
   }
   asm volatile("csrw vstart, %0" : : "r"((long)vstart));                /* vstart 以源字节计 */
-  if (vm) asm volatile(".insn 0x8220818b" ::: "memory");                /* vdot.vv v3,v1,v2 vm=1 */
-  else    asm volatile(".insn 0x8020818b" ::: "memory");                /* vdot.vv v3,v1,v2 vm=0 */
+  if (vm) asm volatile(".insn 0x8220818b" ::: "memory");                /* vdot.vv v3,v2,v1 vm=1 */
+  else    asm volatile(".insn 0x8020818b" ::: "memory");                /* vdot.vv v3,v2,v1 vm=0 */
   asm volatile("csrw vstart, x0");
 
   asm volatile("vsetvli x0, %0, e8, m1, ta, ma" : : "r"((long)VLMAX));

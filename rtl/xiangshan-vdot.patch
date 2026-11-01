@@ -9,7 +9,7 @@ index 3764191..af1497a 100644
 +  /* custom-0 (CIE): vdot.vv vd, vs2, vs1
 +   *   opcode = 0x0B (custom-0), funct6 = 100000, funct3 = 000, vm = ?
 +   *   enc = (funct7 << 25) | (vs2 << 20) | (vs1 << 15) | (funct3 << 12) | (vd << 7) | 0x0B
-+   *   funct7 = funct6 << 1 | vm   => 0x8220818b = vdot.vv v3, v1, v2 (vm = 1)
++   *   funct7 = funct6 << 1 | vm   => 0x8220818b = vdot.vv v3, v2, v1 (vm = 1)
 +   */
 +  val VDOT_VV = BitPat("b100000???????????000?????0001011")
 +

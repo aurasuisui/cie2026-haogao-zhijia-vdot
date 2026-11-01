@@ -6,8 +6,8 @@
  *   mask(vm=0) 与 tail 按 32 位输出元素粒度: 输出元素 i 用 v0[i]
  *
  * 编码: enc = (funct7<<25)|(vs2<<20)|(vs1<<15)|(funct3<<12)|(vd<<7)|0x0B, funct7 = funct6<<1|vm
- *       vdot.vv v3, v1, v2, vm=1  -> 0x8220818b
- *       vdot.vv v3, v1, v2, vm=0  -> 0x8020818b
+ *       vdot.vv v3, v2, v1, vm=1  -> 0x8220818b
+ *       vdot.vv v3, v2, v1, vm=0  -> 0x8020818b
  *
  * GNU as 对向量自定义指令的 .insn r 形式会报 "bad value for funct2 field", 只能整条写死.
  */
@@ -77,9 +77,9 @@ static void exec_vdot(int vl, int vm, int ta, int ma)
 {
     vset_e8(vl, ta, ma);                  /* 指令真正执行时的 vl / vta / vma */
     if (vm)
-        asm volatile(".insn 0x8220818b"); /* vdot.vv v3, v1, v2, vm=1 */
+        asm volatile(".insn 0x8220818b"); /* vdot.vv v3, v2, v1, vm=1 */
     else
-        asm volatile(".insn 0x8020818b"); /* vdot.vv v3, v1, v2, vm=0 (v0 掩码) */
+        asm volatile(".insn 0x8020818b"); /* vdot.vv v3, v2, v1, vm=0 (v0 掩码) */
     vset_e8(VL, 1, 1);                    /* 恢复 vl 以便整寄存器回读 */
     asm volatile("vse8.v v3, (%0)" :: "r"(OUT) : "memory");
     asm volatile("" ::: "memory");

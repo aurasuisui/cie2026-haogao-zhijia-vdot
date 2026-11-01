@@ -60,7 +60,7 @@ int main(void)
     /* ---- 1) 非法 vtype: e16/m1 下执行 vdot.vv ---- */
     size_t vl = 0;
     asm volatile("vsetvli %0, %1, e16, m1, ta, ma" : "=r"(vl) : "r"((long)8) : "memory");
-    printf("[ILLEGAL-TEST] vtype=e16,m1 vl=%d -> executing vdot.vv v3,v1,v2 (expect illegal)\n",
+    printf("[ILLEGAL-TEST] vtype=e16,m1 vl=%d -> executing vdot.vv v3,v2,v1 (expect illegal)\n",
            (int)vl);
     do_vdot();
     asm volatile("" ::: "memory");

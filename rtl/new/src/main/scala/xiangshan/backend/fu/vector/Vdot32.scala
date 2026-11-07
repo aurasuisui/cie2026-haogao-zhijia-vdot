@@ -29,7 +29,7 @@ class Vdot32 extends Module {
       val b = io.vs1(8 * idx + 7, 8 * idx).asSInt
       a * b // SInt(16)
     }
-    // 16 + 2 = 18 bits, then sign extend to 32 bits
+    // the sum needs 18 bits; the left fold widens 16 -> 17 -> 18 -> 19, then pad(32)
     io.out(i) := prods.reduce(_ +& _).pad(32)
   }
 }
